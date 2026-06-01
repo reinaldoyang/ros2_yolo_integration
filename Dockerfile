@@ -1,6 +1,10 @@
 # 使用 ultralytics 的 Jetson JetPack 6 映像作為基底
 FROM ultralytics/ultralytics:latest-jetson-jetpack6
 
+RUN python3 -m pip uninstall -y torch torchvision torchaudio || true
+RUN python3 -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+RUN python3 -m pip install --no-cache-dir --upgrade ultralytics==8.4.58
+
 # 設定環境變數
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=humble

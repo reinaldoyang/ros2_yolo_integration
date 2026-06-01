@@ -3,6 +3,7 @@ from glob import glob
 import os
 
 package_name = "yolo_example_pkg"
+model_files = sorted(path for path in glob("models/*.pt") if os.path.isfile(path))
 
 setup(
     name=package_name,
@@ -11,7 +12,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        (os.path.join("share", package_name, "models"), glob("models/*.pt")),
+        (os.path.join("share", package_name, "models"), model_files),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

@@ -35,3 +35,7 @@ AMENT_IGNORE
 # End of https://www.toptal.com/developers/gitignore/api/ros2
 
 *.png
+# Ignore local YOLO model weights and backup files
+*.pt
+*.bak
+*_original.py
