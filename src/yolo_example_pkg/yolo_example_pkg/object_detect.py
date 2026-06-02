@@ -85,6 +85,21 @@ class YoloDetectionNode(Node):
         # 設定要過濾標籤 (如果為空，那就不過濾)
         self.allowed_labels = {"tennis"}
 
+        # Single-target lock state for stable bear tracking
+        self.locked_target = False
+        self.locked_cx = None
+        self.locked_cy = None
+        self.locked_distance = None
+        self.locked_delta_x = None
+        self.target_lost_count = 0
+        self.max_target_lost_frames = 10
+        self.switch_distance_margin = 0.10
+        self.same_depth_margin = 0.05
+        self.center_switch_margin = 50.0
+        self.max_match_distance = 120.0
+        self.target_class = "bear"
+        self.debug_target_lock = False
+
         # 設定 YOLO 可信度閾值
         self.conf_threshold = 0.5  # 可以修改這個值來調整可信度
 
@@ -226,13 +241,10 @@ class YoloDetectionNode(Node):
 
     def draw_bounding_boxes(self, image, results):
         """在影像上繪製 YOLO 檢測到的 Bounding Box"""
-        # 一開始預設沒找到目標
-        found_target = 0
-        target_distance = 0.0
-        delta_x = 0.0
         det_image = image.copy()
-        tmp_image = image.copy()
-        tmp_image, points = self.draw_cross(tmp_image)
+        image_center_x = image.shape[1] / 2.0
+        bear_candidates = []
+
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -240,23 +252,15 @@ class YoloDetectionNode(Node):
                 class_id = int(box.cls[0])
                 class_name = self.det_model.names[class_id]
 
-                # # 只保留設定內的標籤
-                # if self.allowed_labels and class_name not in self.allowed_labels:
-                #     continue
-
                 # 計算 Bounding Box 正中心點
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-                # 如果符合標籤，表示找到目標
-                found_target = 1
-
                 # 優先使用無壓縮的深度圖
                 depth_value = self.get_depth_at(cx, cy)
-                target_distance = depth_value
                 depth_text = f"{depth_value:.2f}m" if depth_value else "N/A"
 
                 # ------ 計算與影像中心的偏移量 ------
-                delta_x = cx - points[4][0]
+                delta_x = cx - image_center_x
 
                 # 根據 class_id 產生隨機但固定的顏色 (B, G, R)
                 rng = np.random.RandomState(class_id)
@@ -275,8 +279,205 @@ class YoloDetectionNode(Node):
                     color,
                     2,
                 )
-        self.publish_target_info(found_target, target_distance, delta_x)
+
+                if class_name != self.target_class:
+                    continue
+
+                bear_candidates.append(
+                    {
+                        "cx": cx,
+                        "cy": cy,
+                        "distance": depth_value,
+                        "delta_x": delta_x,
+                        "confidence": conf,
+                        "valid_depth": depth_value > 0 and depth_value != -1.0,
+                    }
+                )
+
+        selected_bear = self.select_locked_bear_target(bear_candidates)
+        if selected_bear is None:
+            self.publish_target_info(0, 0.0, 0.0)
+        else:
+            self.publish_target_info(
+                1,
+                selected_bear["distance"],
+                selected_bear["delta_x"],
+            )
         return det_image
+
+    def select_locked_bear_target(self, bear_candidates):
+        """Select one bear and maintain a stable target lock across frames."""
+        if not bear_candidates:
+            if self.locked_target:
+                self.mark_locked_bear_lost()
+            return None
+
+        best_bear = self.select_best_bear_candidate(bear_candidates)
+        if not self.locked_target:
+            self.lock_bear(best_bear, "Locked new bear")
+            return best_bear
+
+        matched_bear, match_distance = self.find_matched_locked_bear(bear_candidates)
+
+        if matched_bear is None or match_distance >= self.max_match_distance:
+            last_locked_bear = self.get_last_locked_target()
+            unlocked_after_loss = self.mark_locked_bear_lost()
+
+            if self.should_switch_target(best_bear, last_locked_bear):
+                self.lock_bear(best_bear, "Switching to closer bear")
+                return best_bear
+
+            if unlocked_after_loss:
+                self.lock_bear(best_bear, "Locked new bear")
+                return best_bear
+
+            return None
+
+        if self.should_switch_target(best_bear, matched_bear):
+            self.lock_bear(best_bear, "Switching to closer bear")
+            return best_bear
+
+        self.update_locked_bear(matched_bear)
+        if self.debug_target_lock:
+            print(
+                "[YOLO target] Keeping current bear "
+                f"center=({self.locked_cx}, {self.locked_cy}), "
+                f"distance={matched_bear['distance']:.2f}, "
+                f"delta_x={matched_bear['delta_x']:.1f}, "
+                f"match_distance={match_distance:.1f}px"
+            )
+        return matched_bear
+
+    def lock_bear(self, candidate, message):
+        self.update_locked_bear(candidate)
+        print(
+            f"[YOLO target] {message} "
+            f"center=({self.locked_cx}, {self.locked_cy}), "
+            f"distance={candidate['distance']:.2f}, "
+            f"delta_x={candidate['delta_x']:.1f}, "
+            f"confidence={candidate['confidence']:.2f}"
+        )
+
+    def update_locked_bear(self, candidate):
+        self.locked_target = True
+        self.locked_cx = candidate["cx"]
+        self.locked_cy = candidate["cy"]
+        self.locked_distance = candidate["distance"]
+        self.locked_delta_x = candidate["delta_x"]
+        self.target_lost_count = 0
+
+    def get_last_locked_target(self):
+        if self.locked_distance is None or self.locked_delta_x is None:
+            return None
+
+        return {
+            "cx": self.locked_cx,
+            "cy": self.locked_cy,
+            "distance": self.locked_distance,
+            "delta_x": self.locked_delta_x,
+            "confidence": 0.0,
+            "valid_depth": self.locked_distance > 0 and self.locked_distance != -1.0,
+        }
+
+    def find_matched_locked_bear(self, bear_candidates):
+        if self.locked_cx is None or self.locked_cy is None:
+            return None, float("inf")
+
+        return min(
+            (
+                (
+                    candidate,
+                    np.hypot(
+                        candidate["cx"] - self.locked_cx,
+                        candidate["cy"] - self.locked_cy,
+                    ),
+                )
+                for candidate in bear_candidates
+            ),
+            key=lambda item: item[1],
+        )
+
+    def should_switch_target(self, best_bear, locked_bear):
+        if best_bear is None or locked_bear is None:
+            return False
+
+        if not best_bear["valid_depth"] or not locked_bear["valid_depth"]:
+            return False
+
+        if best_bear is locked_bear:
+            return False
+
+        closer_by_distance = (
+            best_bear["distance"]
+            < locked_bear["distance"] - self.switch_distance_margin
+        )
+        more_centered_at_same_depth = (
+            abs(best_bear["distance"] - locked_bear["distance"])
+            < self.same_depth_margin
+            and abs(best_bear["delta_x"]) + self.center_switch_margin
+            < abs(locked_bear["delta_x"])
+        )
+
+        if closer_by_distance or more_centered_at_same_depth:
+            return True
+
+        if self.debug_target_lock:
+            print(
+                "[YOLO target] Keeping current bear; "
+                f"best_distance={best_bear['distance']:.2f}, "
+                f"locked_distance={locked_bear['distance']:.2f}, "
+                f"best_delta_x={best_bear['delta_x']:.1f}, "
+                f"locked_delta_x={locked_bear['delta_x']:.1f}"
+            )
+        return False
+
+    def select_best_bear_candidate(self, bear_candidates):
+        valid_depth_candidates = [
+            candidate
+            for candidate in bear_candidates
+            if candidate["valid_depth"]
+        ]
+
+        if valid_depth_candidates:
+            closest_distance = min(
+                candidate["distance"] for candidate in valid_depth_candidates
+            )
+            similar_depth_candidates = [
+                candidate
+                for candidate in valid_depth_candidates
+                if candidate["distance"] <= closest_distance + self.same_depth_margin
+            ]
+            return min(
+                similar_depth_candidates,
+                key=lambda candidate: abs(candidate["delta_x"]),
+            )
+
+        return min(
+            bear_candidates,
+            key=lambda candidate: abs(candidate["delta_x"]),
+        )
+
+    def mark_locked_bear_lost(self):
+        self.target_lost_count += 1
+        print(
+            "[YOLO target] Lost locked bear "
+            f"{self.target_lost_count}/{self.max_target_lost_frames}"
+        )
+
+        if self.target_lost_count > self.max_target_lost_frames:
+            print("[YOLO target] Unlocking bear target after lost timeout")
+            self.unlock_bear_target()
+            return True
+
+        return False
+
+    def unlock_bear_target(self):
+        self.locked_target = False
+        self.locked_cx = None
+        self.locked_cy = None
+        self.locked_distance = None
+        self.locked_delta_x = None
+        self.target_lost_count = 0
 
     def draw_masks(self, image, results):
         """在影像上繪製 YOLO 檢測到的 Mask"""
