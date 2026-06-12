@@ -1,5 +1,6 @@
 import base64
 import binascii
+import copy
 import math
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from geometry_msgs.msg import Quaternion
 from nav_msgs.msg import OccupancyGrid
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -34,6 +36,7 @@ class SemanticCostmapNode(Node):
         self.declare_parameter("depth_topic", "/camera/depth/compressed")
         self.declare_parameter("depth_is_compressed", True)
         self.declare_parameter("camera_info_topic", "/camera_info")
+        self.declare_parameter("map_topic", "/map")
         self.declare_parameter("grid_width", 200)
         self.declare_parameter("grid_height", 200)
         self.declare_parameter("resolution", 0.05)
@@ -43,6 +46,13 @@ class SemanticCostmapNode(Node):
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("confidence_threshold", 0.5)
         self.declare_parameter("max_depth", 4.0)
+        self.declare_parameter("enable_obstacle_memory", True)
+        self.declare_parameter("obstacle_memory_decay_sec", 0.0)
+        self.declare_parameter("obstacle_confirm_sec", 3.0)
+        self.declare_parameter("obstacle_confirm_gap_sec", 1.0)
+        self.declare_parameter("obstacle_clear_confirm_sec", 3.0)
+        self.declare_parameter("obstacle_clear_gap_sec", 1.0)
+        self.declare_parameter("semantic_memory_resolution", 0.05)
 
         self.image_topic = self.get_parameter("image_topic").value
         self.depth_topic = self.get_parameter("depth_topic").value
@@ -50,6 +60,7 @@ class SemanticCostmapNode(Node):
             self.get_parameter("depth_is_compressed").value
         )
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
+        self.map_topic = self.get_parameter("map_topic").value
         self.grid_width = int(self.get_parameter("grid_width").value)
         self.grid_height = int(self.get_parameter("grid_height").value)
         self.resolution = float(self.get_parameter("resolution").value)
@@ -61,6 +72,27 @@ class SemanticCostmapNode(Node):
         self.camera_frame_param = self.get_parameter("camera_frame").value
         self.conf_threshold = float(self.get_parameter("confidence_threshold").value)
         self.max_depth = float(self.get_parameter("max_depth").value)
+        self.enable_obstacle_memory = bool(
+            self.get_parameter("enable_obstacle_memory").value
+        )
+        self.obstacle_memory_decay_sec = float(
+            self.get_parameter("obstacle_memory_decay_sec").value
+        )
+        self.obstacle_confirm_sec = float(
+            self.get_parameter("obstacle_confirm_sec").value
+        )
+        self.obstacle_confirm_gap_sec = float(
+            self.get_parameter("obstacle_confirm_gap_sec").value
+        )
+        self.obstacle_clear_confirm_sec = float(
+            self.get_parameter("obstacle_clear_confirm_sec").value
+        )
+        self.obstacle_clear_gap_sec = float(
+            self.get_parameter("obstacle_clear_gap_sec").value
+        )
+        self.semantic_memory_resolution = float(
+            self.get_parameter("semantic_memory_resolution").value
+        )
 
         model_path = self.resolve_model_path("segmentation.pt")
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,7 +103,17 @@ class SemanticCostmapNode(Node):
         self.latest_depth = None
         self.latest_depth_frame = ""
         self.latest_camera_info = None
+        self.latest_map_info = None
+        self.latest_map_frame = self.target_frame
         self.last_depth_debug_log_time = 0.0
+        self.obstacle_memory = {}
+        self.pending_obstacle_memory = {}
+        self.pending_clear_memory = {}
+        self.last_observed_obstacle_cell_count = 0
+        self.last_observed_clear_cell_count = 0
+        self.last_obstacle_memory_log_time = 0.0
+        self.initial_empty_obstacle_grid_published = False
+        self.startup_obstacle_reset_done = False
 
         self.image_sub = self.create_subscription(
             CompressedImage, self.image_topic, self.image_callback, 1
@@ -83,13 +125,31 @@ class SemanticCostmapNode(Node):
         self.camera_info_sub = self.create_subscription(
             CameraInfo, self.camera_info_topic, self.camera_info_callback, 1
         )
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, self.map_topic, self.map_callback, map_qos
+        )
         self.grid_pub = self.create_publisher(OccupancyGrid, "/semantic_bridge_grid", 1)
+        self.obstacle_grid_pub = self.create_publisher(
+            OccupancyGrid, "/semantic_obstacle_grid", map_qos
+        )
 
         self.get_logger().info(
             "Semantic costmap node ready: "
             f"image={self.image_topic}, depth={self.depth_topic}, "
             f"depth_is_compressed={self.depth_is_compressed}, "
-            f"camera_info={self.camera_info_topic}, output=/semantic_bridge_grid"
+            f"camera_info={self.camera_info_topic}, map={self.map_topic}, "
+            "outputs=/semantic_bridge_grid,/semantic_obstacle_grid, "
+            f"enable_obstacle_memory={self.enable_obstacle_memory}, "
+            f"obstacle_memory_decay_sec={self.obstacle_memory_decay_sec:.1f}, "
+            f"obstacle_confirm_sec={self.obstacle_confirm_sec:.1f}, "
+            f"obstacle_clear_confirm_sec={self.obstacle_clear_confirm_sec:.1f}, "
+            f"semantic_memory_resolution={self.semantic_memory_resolution:.3f}"
         )
 
     def resolve_model_path(self, filename):
@@ -247,6 +307,28 @@ class SemanticCostmapNode(Node):
     def camera_info_callback(self, msg):
         self.latest_camera_info = msg
 
+    def map_callback(self, msg):
+        new_map_info = copy.deepcopy(msg.info)
+        new_map_frame = msg.header.frame_id or self.target_frame
+        self.latest_map_info = new_map_info
+        self.latest_map_frame = new_map_frame
+
+        if not self.startup_obstacle_reset_done:
+            self.clear_obstacle_memory("node started")
+            self.publish_semantic_obstacle_grid()
+            self.initial_empty_obstacle_grid_published = True
+            self.startup_obstacle_reset_done = True
+            return
+
+    def clear_obstacle_memory(self, reason):
+        self.obstacle_memory.clear()
+        self.pending_obstacle_memory.clear()
+        self.pending_clear_memory.clear()
+        self.last_observed_obstacle_cell_count = 0
+        self.last_observed_clear_cell_count = 0
+        self.initial_empty_obstacle_grid_published = False
+        self.get_logger().info(f"Semantic obstacle memory cleared: {reason}")
+
     def image_callback(self, msg):
         if self.latest_depth is None or self.latest_camera_info is None:
             self.get_logger().debug("Waiting for depth image and camera_info")
@@ -285,6 +367,7 @@ class SemanticCostmapNode(Node):
             results, image.shape, transform, grid, origin_x, origin_y
         )
         self.publish_grid(grid, origin_x, origin_y)
+        self.publish_semantic_obstacle_grid()
 
     def get_camera_frame(self, image_msg):
         if self.camera_frame_param:
@@ -356,6 +439,8 @@ class SemanticCostmapNode(Node):
             ],
             dtype=np.float64,
         )
+        observed_obstacle_keys = set()
+        observed_clear_keys = set()
 
         for result in results:
             if result.masks is None or result.boxes is None:
@@ -396,8 +481,31 @@ class SemanticCostmapNode(Node):
 
                     if semantic_value == 100:
                         self.mark_obstacle(grid, cell[0], cell[1])
+                        observed_obstacle_keys.update(
+                            self.get_obstacle_keys_for_point(
+                                point_map[0], point_map[1]
+                            )
+                        )
                     elif grid[cell[1], cell[0]] != 100:
                         grid[cell[1], cell[0]] = 0
+                        observed_clear_keys.update(
+                            self.get_memory_keys_for_point(
+                                point_map[0], point_map[1], radius=0.0
+                            )
+                        )
+
+        if observed_obstacle_keys:
+            self.get_logger().debug(
+                f"Observed semantic obstacle keys this frame: {len(observed_obstacle_keys)}"
+            )
+        if observed_clear_keys:
+            self.get_logger().debug(
+                f"Observed semantic clear keys this frame: {len(observed_clear_keys)}"
+            )
+        self.last_observed_obstacle_cell_count = len(observed_obstacle_keys)
+        self.last_observed_clear_cell_count = len(observed_clear_keys)
+        self.observe_obstacle_cells(observed_obstacle_keys)
+        self.observe_clear_cells(observed_clear_keys)
 
     def get_class_name(self, class_id):
         names = self.seg_model.names
@@ -458,6 +566,192 @@ class SemanticCostmapNode(Node):
                 if 0 <= c < self.grid_width and 0 <= r < self.grid_height:
                     grid[r, c] = 100
 
+    def get_obstacle_keys_for_point(self, x, y):
+        return self.get_memory_keys_for_point(
+            x, y, radius=self.obstacle_inflation_radius
+        )
+
+    def get_memory_keys_for_point(self, x, y, radius):
+        if not self.enable_obstacle_memory or self.semantic_memory_resolution <= 0.0:
+            return []
+
+        center_x = int(round(x / self.semantic_memory_resolution))
+        center_y = int(round(y / self.semantic_memory_resolution))
+        inflation_keys = int(math.ceil(radius / self.semantic_memory_resolution))
+        keys = []
+
+        for dy in range(-inflation_keys, inflation_keys + 1):
+            for dx in range(-inflation_keys, inflation_keys + 1):
+                if dx * dx + dy * dy > inflation_keys * inflation_keys:
+                    continue
+                keys.append((center_x + dx, center_y + dy))
+        return keys
+
+    def observe_obstacle_cells(self, obstacle_cells):
+        if not obstacle_cells:
+            return
+
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        for cell in obstacle_cells:
+            self.update_pending_obstacle(cell, stamp)
+
+    def update_pending_obstacle(self, cell, stamp):
+        if cell in self.obstacle_memory:
+            self.obstacle_memory[cell] = stamp
+            return
+
+        pending = self.pending_obstacle_memory.get(cell)
+        if pending is None or stamp - pending["last_seen"] > self.obstacle_confirm_gap_sec:
+            self.pending_obstacle_memory[cell] = {
+                "first_seen": stamp,
+                "last_seen": stamp,
+            }
+            return
+
+        pending["last_seen"] = stamp
+        if pending["last_seen"] - pending["first_seen"] >= self.obstacle_confirm_sec:
+            self.obstacle_memory[cell] = stamp
+            del self.pending_obstacle_memory[cell]
+
+    def observe_clear_cells(self, clear_cells):
+        if not clear_cells:
+            return
+
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        for cell in clear_cells:
+            self.update_pending_clear(cell, stamp)
+
+    def update_pending_clear(self, cell, stamp):
+        if cell not in self.obstacle_memory and cell not in self.pending_obstacle_memory:
+            self.pending_clear_memory.pop(cell, None)
+            return
+
+        pending = self.pending_clear_memory.get(cell)
+        if pending is None or stamp - pending["last_seen"] > self.obstacle_clear_gap_sec:
+            self.pending_clear_memory[cell] = {
+                "first_seen": stamp,
+                "last_seen": stamp,
+            }
+            return
+
+        pending["last_seen"] = stamp
+        if pending["last_seen"] - pending["first_seen"] >= self.obstacle_clear_confirm_sec:
+            self.obstacle_memory.pop(cell, None)
+            self.pending_obstacle_memory.pop(cell, None)
+            del self.pending_clear_memory[cell]
+
+    def map_point_to_static_map_cell(self, x, y):
+        if self.latest_map_info is None:
+            return None
+
+        origin = self.latest_map_info.origin
+        resolution = float(self.latest_map_info.resolution)
+        if resolution <= 0.0:
+            return None
+
+        yaw = self.quaternion_to_yaw(origin.orientation)
+        dx = x - origin.position.x
+        dy = y - origin.position.y
+
+        # Convert map-frame coordinates into the OccupancyGrid's fixed index
+        # frame. Most maps have yaw=0, but this keeps the grid aligned if they do not.
+        local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+        local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+        col = int(math.floor(local_x / resolution))
+        row = int(math.floor(local_y / resolution))
+
+        if col < 0 or col >= self.latest_map_info.width:
+            return None
+        if row < 0 or row >= self.latest_map_info.height:
+            return None
+        return col, row
+
+    def memory_key_to_point(self, key):
+        return (
+            key[0] * self.semantic_memory_resolution,
+            key[1] * self.semantic_memory_resolution,
+        )
+
+    def prune_obstacle_memory(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        stale_pending_cells = [
+            cell
+            for cell, pending in self.pending_obstacle_memory.items()
+            if now - pending["last_seen"] > self.obstacle_confirm_gap_sec
+        ]
+        for cell in stale_pending_cells:
+            del self.pending_obstacle_memory[cell]
+
+        stale_clear_cells = [
+            cell
+            for cell, pending in self.pending_clear_memory.items()
+            if now - pending["last_seen"] > self.obstacle_clear_gap_sec
+        ]
+        for cell in stale_clear_cells:
+            del self.pending_clear_memory[cell]
+
+        if self.obstacle_memory_decay_sec <= 0.0:
+            return
+
+        cutoff = now - self.obstacle_memory_decay_sec
+        stale_cells = [
+            cell
+            for cell, stamp in self.obstacle_memory.items()
+            if stamp < cutoff
+        ]
+        for cell in stale_cells:
+            del self.obstacle_memory[cell]
+
+    def publish_semantic_obstacle_grid(self):
+        if self.latest_map_info is None:
+            self.get_logger().warn(
+                "Waiting for /map before publishing /semantic_obstacle_grid",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        if self.enable_obstacle_memory:
+            self.prune_obstacle_memory()
+
+        width = int(self.latest_map_info.width)
+        height = int(self.latest_map_info.height)
+        # Use 0 as the background so Foxglove/Nav2-style viewers do not render
+        # unknown cells as high cost. Only remembered bridge/wall cells are 100.
+        obstacle_grid = np.zeros((height, width), dtype=np.int8)
+        if self.enable_obstacle_memory:
+            for key in self.obstacle_memory:
+                point = self.memory_key_to_point(key)
+                cell = self.map_point_to_static_map_cell(point[0], point[1])
+                if cell is None:
+                    continue
+                col, row = cell
+                if 0 <= col < width and 0 <= row < height:
+                    obstacle_grid[row, col] = 100
+
+        msg = OccupancyGrid()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.latest_map_frame or self.target_frame
+        msg.info = copy.deepcopy(self.latest_map_info)
+        msg.data = obstacle_grid.reshape(-1).astype(np.int8).tolist()
+        self.obstacle_grid_pub.publish(msg)
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_obstacle_memory_log_time >= 2.0:
+            self.last_obstacle_memory_log_time = now
+            published_count = int(np.count_nonzero(obstacle_grid == 100))
+            self.get_logger().info(
+                "Semantic obstacle memory: "
+                f"observed_obstacle_cells={self.last_observed_obstacle_cell_count}, "
+                f"observed_clear_cells={self.last_observed_clear_cell_count}, "
+                f"pending_obstacle_cells={len(self.pending_obstacle_memory)}, "
+                f"pending_clear_cells={len(self.pending_clear_memory)}, "
+                f"remembered_obstacle_cells={len(self.obstacle_memory)}, "
+                f"published_obstacle_cells={published_count}, "
+                f"memory_resolution={self.semantic_memory_resolution:.3f}, "
+                f"map_size={width}x{height}, "
+                f"map_resolution={self.latest_map_info.resolution:.3f}"
+            )
+
     def publish_grid(self, grid, origin_x, origin_y):
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -471,6 +765,11 @@ class SemanticCostmapNode(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = grid.reshape(-1).astype(np.int8).tolist()
         self.grid_pub.publish(msg)
+
+    def quaternion_to_yaw(self, quat: Quaternion):
+        siny_cosp = 2.0 * (quat.w * quat.z + quat.x * quat.y)
+        cosy_cosp = 1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
     def quaternion_to_matrix(self, quat: Quaternion):
         x = quat.x
