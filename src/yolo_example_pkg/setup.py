@@ -24,6 +24,8 @@ setup(
     entry_points={
         "console_scripts": [
             "yolo_node = yolo_example_pkg.object_detect:main",
+            "yolo_detection_node = yolo_example_pkg.yolo_detection_node:main",
+            "yolo_segmentation_node = yolo_example_pkg.yolo_segmentation_node:main",
         ],
     },
 )
