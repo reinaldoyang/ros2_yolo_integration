@@ -41,7 +41,7 @@ class SemanticCostmapNode(Node):
         self.declare_parameter("grid_height", 200)
         self.declare_parameter("resolution", 0.05)
         self.declare_parameter("pixel_sample_step", 8)
-        self.declare_parameter("obstacle_inflation_radius", 0.15)
+        self.declare_parameter("obstacle_inflation_radius", 0.30)
         self.declare_parameter("target_frame", "map")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("confidence_threshold", 0.5)
@@ -146,6 +146,7 @@ class SemanticCostmapNode(Node):
             f"camera_info={self.camera_info_topic}, map={self.map_topic}, "
             "outputs=/semantic_bridge_grid,/semantic_obstacle_grid, "
             f"enable_obstacle_memory={self.enable_obstacle_memory}, "
+            f"obstacle_inflation_radius={self.obstacle_inflation_radius:.2f}, "
             f"obstacle_memory_decay_sec={self.obstacle_memory_decay_sec:.1f}, "
             f"obstacle_confirm_sec={self.obstacle_confirm_sec:.1f}, "
             f"obstacle_clear_confirm_sec={self.obstacle_clear_confirm_sec:.1f}, "
