@@ -60,22 +60,11 @@ class YoloDetectionNode(Node):
         self.x_multi_depth_pub = self.create_publisher(
             Float32MultiArray, "/camera/x_multi_depth_values", 10
         )
-
         # 設定要過濾標籤 (如果為空，那就不過濾)
         self.allowed_labels = {"tennis"}
 
-        # Single-target lock state for stable bear tracking
-        self.locked_target = False
-        self.locked_cx = None
-        self.locked_cy = None
-        self.locked_distance = None
-        self.locked_delta_x = None
-        self.target_lost_count = 0
-        self.max_target_lost_frames = 10
-        self.same_depth_margin = 0.05
-        self.max_match_distance = 120.0
+        # Bear target selection state
         self.target_class = "bear"
-        self.debug_target_lock = False
 
         # 設定 YOLO 可信度閾值
         self.conf_threshold = 0.5  # 可以修改這個值來調整可信度
@@ -254,7 +243,7 @@ class YoloDetectionNode(Node):
                     }
                 )
 
-        selected_bear = self.select_locked_bear_target(bear_candidates)
+        selected_bear = self.select_best_bear_candidate(bear_candidates)
         if selected_bear is None:
             self.publish_target_info(0, 0.0, 0.0)
         else:
@@ -265,77 +254,11 @@ class YoloDetectionNode(Node):
             )
         return det_image
 
-    def select_locked_bear_target(self, bear_candidates):
-        """Select one bear and maintain a stable target lock across frames."""
-        if not bear_candidates:
-            if self.locked_target:
-                self.mark_locked_bear_lost()
-            return None
-
-        best_bear = self.select_best_bear_candidate(bear_candidates)
-        if not self.locked_target:
-            self.lock_bear(best_bear, "Locked new bear")
-            return best_bear
-
-        matched_bear, match_distance = self.find_matched_locked_bear(bear_candidates)
-
-        if matched_bear is None or match_distance >= self.max_match_distance:
-            unlocked_after_loss = self.mark_locked_bear_lost()
-
-            if unlocked_after_loss:
-                self.lock_bear(best_bear, "Locked new bear")
-                return best_bear
-
-            return None
-
-        self.update_locked_bear(matched_bear)
-        if self.debug_target_lock:
-            print(
-                "[YOLO target] Keeping current bear "
-                f"center=({self.locked_cx}, {self.locked_cy}), "
-                f"distance={matched_bear['distance']:.2f}, "
-                f"delta_x={matched_bear['delta_x']:.1f}, "
-                f"match_distance={match_distance:.1f}px"
-            )
-        return matched_bear
-
-    def lock_bear(self, candidate, message):
-        self.update_locked_bear(candidate)
-        print(
-            f"[YOLO target] {message} "
-            f"center=({self.locked_cx}, {self.locked_cy}), "
-            f"distance={candidate['distance']:.2f}, "
-            f"delta_x={candidate['delta_x']:.1f}, "
-            f"confidence={candidate['confidence']:.2f}"
-        )
-
-    def update_locked_bear(self, candidate):
-        self.locked_target = True
-        self.locked_cx = candidate["cx"]
-        self.locked_cy = candidate["cy"]
-        self.locked_distance = candidate["distance"]
-        self.locked_delta_x = candidate["delta_x"]
-        self.target_lost_count = 0
-
-    def find_matched_locked_bear(self, bear_candidates):
-        if self.locked_cx is None or self.locked_cy is None:
-            return None, float("inf")
-
-        return min(
-            (
-                (
-                    candidate,
-                    np.hypot(
-                        candidate["cx"] - self.locked_cx,
-                        candidate["cy"] - self.locked_cy,
-                    ),
-                )
-                for candidate in bear_candidates
-            ),
-            key=lambda item: item[1],
-        )
-
     def select_best_bear_candidate(self, bear_candidates):
+        """Select the nearest bear by depth; fall back to the most centered bear."""
+        if not bear_candidates:
+            return None
+
         valid_depth_candidates = [
             candidate
             for candidate in bear_candidates
@@ -343,45 +266,18 @@ class YoloDetectionNode(Node):
         ]
 
         if valid_depth_candidates:
-            closest_distance = min(
-                candidate["distance"] for candidate in valid_depth_candidates
-            )
-            similar_depth_candidates = [
-                candidate
-                for candidate in valid_depth_candidates
-                if candidate["distance"] <= closest_distance + self.same_depth_margin
-            ]
             return min(
-                similar_depth_candidates,
-                key=lambda candidate: abs(candidate["delta_x"]),
+                valid_depth_candidates,
+                key=lambda candidate: (
+                    candidate["distance"],
+                    abs(candidate["delta_x"]),
+                ),
             )
 
         return min(
             bear_candidates,
             key=lambda candidate: abs(candidate["delta_x"]),
         )
-
-    def mark_locked_bear_lost(self):
-        self.target_lost_count += 1
-        print(
-            "[YOLO target] Lost locked bear "
-            f"{self.target_lost_count}/{self.max_target_lost_frames}"
-        )
-
-        if self.target_lost_count > self.max_target_lost_frames:
-            print("[YOLO target] Unlocking bear target after lost timeout")
-            self.unlock_bear_target()
-            return True
-
-        return False
-
-    def unlock_bear_target(self):
-        self.locked_target = False
-        self.locked_cx = None
-        self.locked_cy = None
-        self.locked_distance = None
-        self.locked_delta_x = None
-        self.target_lost_count = 0
 
 
     def get_depth_at(self, x, y):
