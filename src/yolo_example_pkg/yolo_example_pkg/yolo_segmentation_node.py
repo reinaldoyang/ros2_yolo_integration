@@ -1,8 +1,10 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 import cv2
+import json
 import numpy as np
 from ultralytics import YOLO
 from pathlib import Path
@@ -32,6 +34,9 @@ class YoloSegmentationNode(Node):
 
         self.seg_image_pub = self.create_publisher(
             CompressedImage, "/yolo/segmentation/compressed", 10
+        )
+        self.seg_status_pub = self.create_publisher(
+            String, "/yolo/segmentation/status", 10
         )
 
         # 設定 YOLO 可信度閾值
@@ -92,6 +97,7 @@ class YoloSegmentationNode(Node):
             return
 
         seg_image = self.draw_masks(cv_image, seg_results)
+        self.publish_segmentation_status(seg_results, cv_image.shape)
         self.publish_seg_image(seg_image)
 
 
@@ -187,6 +193,68 @@ class YoloSegmentationNode(Node):
                     mask_image = cv2.addWeighted(mask_image, 1, mask_colored, 0.5, 0)
 
         return mask_image
+
+    def publish_segmentation_status(self, results, image_shape):
+        height, width = image_shape[:2]
+        bridge_mask = np.zeros((height, width), dtype=bool)
+        road_mask = np.zeros((height, width), dtype=bool)
+        wall_mask = np.zeros((height, width), dtype=bool)
+
+        for result in results:
+            if result.masks is None or result.boxes is None:
+                continue
+
+            masks = result.masks.data.cpu().numpy()
+            boxes = result.boxes
+            for i, mask in enumerate(masks):
+                class_id = int(boxes.cls[i])
+                class_name = self.get_class_name(class_id)
+                mask_resized = cv2.resize(mask, (width, height)) > 0.5
+
+                if "wall" in class_name:
+                    wall_mask |= mask_resized
+                elif "bridge" in class_name or "whole_bridge" in class_name:
+                    bridge_mask |= mask_resized
+                elif "road" in class_name:
+                    road_mask |= mask_resized
+
+        bridge_pixels_v, bridge_pixels_u = np.where(bridge_mask)
+        bridge_area_ratio = float(np.count_nonzero(bridge_mask)) / float(width * height)
+        bridge_center_x = (
+            float(np.mean(bridge_pixels_u)) if bridge_pixels_u.size > 0 else -1.0
+        )
+        lower_start = height // 2
+        lower_pixel_count = float(width * (height - lower_start))
+        road_lower_ratio = (
+            float(np.count_nonzero(road_mask[lower_start:, :])) / lower_pixel_count
+        )
+        bridge_lower_ratio = (
+            float(np.count_nonzero(bridge_mask[lower_start:, :])) / lower_pixel_count
+        )
+
+        status = {
+            "bridge_detected": bridge_pixels_u.size > 0,
+            "bridge_center_x": bridge_center_x,
+            "bridge_area_ratio": bridge_area_ratio,
+            "bridge_lower_ratio": bridge_lower_ratio,
+            "road_area_ratio": float(np.count_nonzero(road_mask)) / float(width * height),
+            "road_lower_ratio": road_lower_ratio,
+            "wall_area_ratio": float(np.count_nonzero(wall_mask)) / float(width * height),
+            "image_width": int(width),
+            "image_height": int(height),
+        }
+
+        msg = String()
+        msg.data = json.dumps(status)
+        self.seg_status_pub.publish(msg)
+
+    def get_class_name(self, class_id):
+        names = self.seg_model.names
+        if isinstance(names, dict):
+            return str(names.get(class_id, class_id)).lower()
+        if 0 <= class_id < len(names):
+            return str(names[class_id]).lower()
+        return str(class_id)
 
     def publish_seg_image(self, image):
         """將 Segmentation 影像轉換並發佈到 ROS"""

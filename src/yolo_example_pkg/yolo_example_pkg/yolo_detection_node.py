@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -56,6 +56,9 @@ class YoloDetectionNode(Node):
         self.target_pub = self.create_publisher(
             Float32MultiArray, "/yolo/target_info", 10
         )
+        self.target_label_sub = self.create_subscription(
+            String, "/target_label", self.target_label_callback, 10
+        )
 
         self.x_multi_depth_pub = self.create_publisher(
             Float32MultiArray, "/camera/x_multi_depth_values", 10
@@ -65,6 +68,10 @@ class YoloDetectionNode(Node):
 
         # Bear target selection state
         self.target_class = "bear"
+        self.target_labels = {self.normalize_label(self.target_class)}
+        self.last_selected_target = None
+        self.target_depth_switch_margin = 0.20
+        self.target_delta_switch_margin = 70.0
 
         # 設定 YOLO 可信度閾值
         self.conf_threshold = 0.5  # 可以修改這個值來調整可信度
@@ -105,6 +112,28 @@ class YoloDetectionNode(Node):
             "Rebuild the package after adding models/*.pt, or place the model in "
             f"the installed share directory for {package_name}."
         )
+
+    def normalize_label(self, label):
+        return str(label).strip().lower().replace("-", "_").replace(" ", "_")
+
+    def target_label_callback(self, msg):
+        labels = {
+            self.normalize_label(label)
+            for label in msg.data.split(",")
+            if label.strip()
+        }
+        if not labels:
+            return
+
+        if labels != self.target_labels:
+            self.target_labels = labels
+            self.target_class = next(iter(labels))
+            self.last_selected_target = None
+            self.get_logger().info(
+                "YOLO target labels set to: "
+                + ", ".join(sorted(self.target_labels))
+            )
+            self.publish_target_info(0, 0.0, 0.0)
 
     def depth_callback_raw(self, msg):
         """接收 **無壓縮** 深度圖"""
@@ -200,6 +229,7 @@ class YoloDetectionNode(Node):
                 conf = float(box.conf)
                 class_id = int(box.cls[0])
                 class_name = self.det_model.names[class_id]
+                normalized_class_name = self.normalize_label(class_name)
 
                 # 計算 Bounding Box 正中心點
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -229,7 +259,7 @@ class YoloDetectionNode(Node):
                     2,
                 )
 
-                if class_name != self.target_class:
+                if normalized_class_name not in self.target_labels:
                     continue
 
                 bear_candidates.append(
@@ -255,8 +285,9 @@ class YoloDetectionNode(Node):
         return det_image
 
     def select_best_bear_candidate(self, bear_candidates):
-        """Select the nearest bear by depth; fall back to the most centered bear."""
+        """Select nearest bear, but avoid switching between similar-depth bears."""
         if not bear_candidates:
+            self.last_selected_target = None
             return None
 
         valid_depth_candidates = [
@@ -266,7 +297,7 @@ class YoloDetectionNode(Node):
         ]
 
         if valid_depth_candidates:
-            return min(
+            best_candidate = min(
                 valid_depth_candidates,
                 key=lambda candidate: (
                     candidate["distance"],
@@ -274,10 +305,34 @@ class YoloDetectionNode(Node):
                 ),
             )
 
-        return min(
+            if self.last_selected_target is not None:
+                previous_like_candidates = [
+                    candidate
+                    for candidate in valid_depth_candidates
+                    if abs(
+                        candidate["delta_x"] - self.last_selected_target["delta_x"]
+                    ) <= self.target_delta_switch_margin
+                    and candidate["distance"]
+                    <= best_candidate["distance"] + self.target_depth_switch_margin
+                ]
+                if previous_like_candidates:
+                    best_candidate = min(
+                        previous_like_candidates,
+                        key=lambda candidate: abs(
+                            candidate["delta_x"]
+                            - self.last_selected_target["delta_x"]
+                        ),
+                    )
+
+            self.last_selected_target = best_candidate
+            return best_candidate
+
+        best_candidate = min(
             bear_candidates,
             key=lambda candidate: abs(candidate["delta_x"]),
         )
+        self.last_selected_target = best_candidate
+        return best_candidate
 
 
     def get_depth_at(self, x, y):

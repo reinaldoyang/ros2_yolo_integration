@@ -41,7 +41,7 @@ class SemanticCostmapNode(Node):
         self.declare_parameter("grid_height", 200)
         self.declare_parameter("resolution", 0.05)
         self.declare_parameter("pixel_sample_step", 8)
-        self.declare_parameter("obstacle_inflation_radius", 0.30)
+        self.declare_parameter("obstacle_inflation_radius", 0.15)
         self.declare_parameter("target_frame", "map")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("confidence_threshold", 0.5)
