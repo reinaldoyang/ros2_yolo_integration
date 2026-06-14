@@ -46,6 +46,11 @@ class SemanticCostmapNode(Node):
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("confidence_threshold", 0.5)
         self.declare_parameter("max_depth", 4.0)
+        self.declare_parameter("projection_mode", "depth")
+        self.declare_parameter("ground_plane_z", 0.0)
+        self.declare_parameter("rectify_obstacle_masks", True)
+        self.declare_parameter("obstacle_depth_gate_margin", 0.40)
+        self.declare_parameter("obstacle_depth_gate_percentile", 20.0)
         self.declare_parameter("enable_obstacle_memory", True)
         self.declare_parameter("obstacle_memory_decay_sec", 0.0)
         self.declare_parameter("obstacle_confirm_sec", 3.0)
@@ -72,6 +77,17 @@ class SemanticCostmapNode(Node):
         self.camera_frame_param = self.get_parameter("camera_frame").value
         self.conf_threshold = float(self.get_parameter("confidence_threshold").value)
         self.max_depth = float(self.get_parameter("max_depth").value)
+        self.projection_mode = str(self.get_parameter("projection_mode").value)
+        self.ground_plane_z = float(self.get_parameter("ground_plane_z").value)
+        self.rectify_obstacle_masks = bool(
+            self.get_parameter("rectify_obstacle_masks").value
+        )
+        self.obstacle_depth_gate_margin = float(
+            self.get_parameter("obstacle_depth_gate_margin").value
+        )
+        self.obstacle_depth_gate_percentile = float(
+            self.get_parameter("obstacle_depth_gate_percentile").value
+        )
         self.enable_obstacle_memory = bool(
             self.get_parameter("enable_obstacle_memory").value
         )
@@ -150,6 +166,11 @@ class SemanticCostmapNode(Node):
             f"obstacle_memory_decay_sec={self.obstacle_memory_decay_sec:.1f}, "
             f"obstacle_confirm_sec={self.obstacle_confirm_sec:.1f}, "
             f"obstacle_clear_confirm_sec={self.obstacle_clear_confirm_sec:.1f}, "
+            f"projection_mode={self.projection_mode}, "
+            f"ground_plane_z={self.ground_plane_z:.2f}, "
+            f"rectify_obstacle_masks={self.rectify_obstacle_masks}, "
+            f"obstacle_depth_gate_margin={self.obstacle_depth_gate_margin:.2f}, "
+            f"obstacle_depth_gate_percentile={self.obstacle_depth_gate_percentile:.1f}, "
             f"semantic_memory_resolution={self.semantic_memory_resolution:.3f}"
         )
 
@@ -458,6 +479,16 @@ class SemanticCostmapNode(Node):
 
                 mask_resized = cv2.resize(mask, (image_width, image_height)) > 0.5
                 pixels_v, pixels_u = np.where(mask_resized)
+                obstacle_cells = []
+                obstacle_depth_limit = None
+                if semantic_value == 100:
+                    obstacle_depth_limit = self.get_obstacle_depth_limit(
+                        pixels_u,
+                        pixels_v,
+                        image_width,
+                        image_height,
+                    )
+
                 for v, u in zip(
                     pixels_v[:: self.pixel_sample_step],
                     pixels_u[:: self.pixel_sample_step],
@@ -466,14 +497,29 @@ class SemanticCostmapNode(Node):
                     if z is None:
                         continue
 
-                    # Pinhole projection into the camera optical frame:
-                    # X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy.
-                    x = (u - cx) * z / fx
-                    y = (v - cy) * z / fy
-                    point_map = (
-                        rotation @ np.array([x, y, z], dtype=np.float64)
-                        + translation
+                    if (
+                        semantic_value == 100
+                        and obstacle_depth_limit is not None
+                        and z > obstacle_depth_limit
+                    ):
+                        continue
+
+                    point_map = self.project_pixel_to_map(
+                        u,
+                        v,
+                        image_width,
+                        image_height,
+                        fx,
+                        fy,
+                        cx,
+                        cy,
+                        rotation,
+                        translation,
+                        z,
                     )
+                    if point_map is None:
+                        continue
+
                     cell = self.map_point_to_cell(
                         point_map[0], point_map[1], origin_x, origin_y
                     )
@@ -481,18 +527,31 @@ class SemanticCostmapNode(Node):
                         continue
 
                     if semantic_value == 100:
-                        self.mark_obstacle(grid, cell[0], cell[1])
-                        observed_obstacle_keys.update(
-                            self.get_obstacle_keys_for_point(
-                                point_map[0], point_map[1]
-                            )
-                        )
+                        obstacle_cells.append(cell)
                     elif grid[cell[1], cell[0]] != 100:
                         grid[cell[1], cell[0]] = 0
                         observed_clear_keys.update(
                             self.get_memory_keys_for_point(
                                 point_map[0], point_map[1], radius=0.0
                             )
+                        )
+
+                if semantic_value == 100 and obstacle_cells:
+                    if self.rectify_obstacle_masks and len(obstacle_cells) >= 3:
+                        marked_cells = self.mark_rectified_obstacle(
+                            grid, obstacle_cells
+                        )
+                    else:
+                        marked_cells = []
+                        for col, row in obstacle_cells:
+                            self.mark_obstacle(grid, col, row)
+                            marked_cells.append((col, row))
+
+                    for col, row in marked_cells:
+                        x = origin_x + (col + 0.5) * self.resolution
+                        y = origin_y + (row + 0.5) * self.resolution
+                        observed_obstacle_keys.update(
+                            self.get_memory_keys_for_point(x, y, radius=0.0)
                         )
 
         if observed_obstacle_keys:
@@ -549,6 +608,63 @@ class SemanticCostmapNode(Node):
             return None
         return z
 
+    def get_obstacle_depth_limit(self, pixels_u, pixels_v, image_width, image_height):
+        if self.obstacle_depth_gate_margin < 0.0:
+            return None
+
+        valid_depths = []
+        for v, u in zip(
+            pixels_v[:: self.pixel_sample_step],
+            pixels_u[:: self.pixel_sample_step],
+        ):
+            z = self.get_depth_meters(u, v, image_width, image_height)
+            if z is not None:
+                valid_depths.append(z)
+
+        if not valid_depths:
+            return None
+
+        percentile = min(100.0, max(0.0, self.obstacle_depth_gate_percentile))
+        near_depth = float(np.percentile(np.array(valid_depths), percentile))
+        return near_depth + self.obstacle_depth_gate_margin
+
+    def project_pixel_to_map(
+        self,
+        u,
+        v,
+        image_width,
+        image_height,
+        fx,
+        fy,
+        cx,
+        cy,
+        rotation,
+        translation,
+        z,
+    ):
+        x_norm = (u - cx) / fx
+        y_norm = (v - cy) / fy
+
+        if self.projection_mode == "ground_plane":
+            # Instead of using each obstacle pixel's raw depth, intersect the
+            # camera ray with the map ground plane. This makes bridge/wall
+            # masks behave like a top-down floor projection, which is more
+            # stable for semantic costmap debugging.
+            ray_map = rotation @ np.array([x_norm, y_norm, 1.0], dtype=np.float64)
+            if abs(ray_map[2]) < 1e-6:
+                return None
+
+            scale = (self.ground_plane_z - translation[2]) / ray_map[2]
+            if not math.isfinite(scale) or scale <= 0.0 or scale > self.max_depth:
+                return None
+
+            return translation + ray_map * scale
+
+        # Pinhole projection into the camera optical frame:
+        # X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy.
+        point_camera = np.array([x_norm * z, y_norm * z, z], dtype=np.float64)
+        return rotation @ point_camera + translation
+
     def map_point_to_cell(self, x, y, origin_x, origin_y):
         col = int((x - origin_x) / self.resolution)
         row = int((y - origin_y) / self.resolution)
@@ -566,6 +682,25 @@ class SemanticCostmapNode(Node):
                 r = row + dy
                 if 0 <= c < self.grid_width and 0 <= r < self.grid_height:
                     grid[r, c] = 100
+
+    def mark_rectified_obstacle(self, grid, obstacle_cells):
+        # The raw projected pixels can be ragged because segmentation and depth
+        # are noisy. Fit a minimum-area rectangle to the projected obstacle
+        # footprint so bridge/wall regions appear as a stable top-down shape.
+        points = np.array(obstacle_cells, dtype=np.float32)
+        rect = cv2.minAreaRect(points)
+        box = cv2.boxPoints(rect).astype(np.int32)
+
+        rect_mask = np.zeros(grid.shape, dtype=np.uint8)
+        cv2.fillPoly(rect_mask, [box], 1)
+        rows, cols = np.where(rect_mask > 0)
+
+        marked_cells = []
+        for row, col in zip(rows, cols):
+            if 0 <= col < self.grid_width and 0 <= row < self.grid_height:
+                self.mark_obstacle(grid, col, row)
+                marked_cells.append((col, row))
+        return marked_cells
 
     def get_obstacle_keys_for_point(self, x, y):
         return self.get_memory_keys_for_point(
